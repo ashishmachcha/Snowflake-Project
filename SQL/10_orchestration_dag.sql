@@ -1,0 +1,356 @@
+-- =============================================================================
+-- PIPELINE ORCHESTRATION DAG
+-- Database: MOVIE_PROJECT_DB
+-- Purpose: Task dependency graph, retry logic, SLA monitoring, and
+--          end-to-end pipeline coordination (Bronze → Silver → Gold)
+-- Depends on: All other SQL files
+-- =============================================================================
+
+USE ROLE ACCOUNTADMIN;
+USE WAREHOUSE COMPUTE_WH;
+
+-- =============================================================================
+-- ARCHITECTURE: TASK DAG (Directed Acyclic Graph)
+--
+--  [ROOT TASK: task_pipeline_orchestrator] (scheduled every 5 min)
+--       │
+--       ├── task_cdc_silver_imdb         (when stream has data)
+--       ├── task_cdc_silver_kaggle       (when stream has data)
+--       └── task_cdc_silver_movielens    (when stream has data)
+--                │
+--                ├── task_gold_dim_movies        (after silver IMDB + Kaggle)
+--                ├── task_gold_movie_popularity  (after silver IMDB)
+--                ├── task_gold_financial         (after silver Kaggle)
+--                │       │
+--                │       └── task_gold_genre_performance (after financial)
+--                │
+--                ├── task_gold_user_analytics    (after silver MovieLens)
+--                └── task_dq_post_refresh        (after all gold tasks)
+--                        │
+--                        └── task_pipeline_logger (final: log execution)
+-- =============================================================================
+
+-- =============================================================================
+-- SECTION 1: ROOT ORCHESTRATOR TASK
+-- This is the DAG entry point — runs on schedule, children run conditionally
+-- =============================================================================
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_pipeline_orchestrator
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = '5 MINUTE'
+  COMMENT = 'Root task: DAG entry point for the entire ETL pipeline'
+  ALLOW_OVERLAPPING_EXECUTION = FALSE
+AS
+  -- Root task just logs the pipeline start
+  INSERT INTO MOVIE_PROJECT_DB.OBSERVABILITY.PIPELINE_EXECUTION_LOG
+    (TASK_NAME, TASK_TYPE, STATUS, EXECUTION_START)
+  VALUES
+    ('task_pipeline_orchestrator', 'ORCHESTRATOR', 'RUNNING', CURRENT_TIMESTAMP());
+
+-- =============================================================================
+-- SECTION 2: SILVER LAYER REFRESH TASKS (children of root, stream-conditional)
+-- =============================================================================
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_imdb_refresh
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_pipeline_orchestrator
+  WHEN SYSTEM$STREAM_HAS_DATA('MOVIE_PROJECT_DB.BRONZE_API_IMDB.STREAM_TITLE_BASICS')
+    OR SYSTEM$STREAM_HAS_DATA('MOVIE_PROJECT_DB.BRONZE_API_IMDB.STREAM_TITLE_RATINGS')
+  COMMENT = 'Refreshes Silver IMDB tables when new data arrives'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.SILVER.IMDB_MOVIES_INCREMENTAL tgt
+  USING (
+    SELECT
+      tb.TCONST, tb.PRIMARYTITLE AS TITLE, tb.ORIGINALTITLE,
+      tb.GENRES, tb.STARTYEAR AS RELEASE_YEAR, tb.RUNTIMEMINUTES AS RUNTIME,
+      tr.AVERAGERATING AS IMDB_RATING, tr.NUMVOTES
+    FROM MOVIE_PROJECT_DB.BRONZE_API_IMDB.TITLE_BASICS tb
+    JOIN MOVIE_PROJECT_DB.BRONZE_API_IMDB.TITLE_RATINGS tr ON tb.TCONST = tr.TCONST
+    WHERE tb.TITLETYPE = 'movie' AND tb.STARTYEAR IS NOT NULL AND tr.NUMVOTES >= 100
+  ) src ON tgt.TCONST = src.TCONST
+  WHEN MATCHED THEN UPDATE SET
+    tgt.TITLE = src.TITLE, tgt.GENRES = src.GENRES, tgt.RELEASE_YEAR = src.RELEASE_YEAR,
+    tgt.RUNTIME = src.RUNTIME, tgt.IMDB_RATING = src.IMDB_RATING, tgt.NUMVOTES = src.NUMVOTES,
+    tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (TCONST, TITLE, ORIGINALTITLE, GENRES, RELEASE_YEAR, RUNTIME, IMDB_RATING, NUMVOTES)
+    VALUES (src.TCONST, src.TITLE, src.ORIGINALTITLE, src.GENRES, src.RELEASE_YEAR, src.RUNTIME, src.IMDB_RATING, src.NUMVOTES);
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_silver_imdb_refresh', 'CDC', 'BRONZE_API_IMDB', 'SILVER.IMDB_MOVIES_INCREMENTAL', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_kaggle_refresh
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_pipeline_orchestrator
+  WHEN SYSTEM$STREAM_HAS_DATA('MOVIE_PROJECT_DB.BRONZE_API_KAGGLE2.STREAM_MOVIES_METADATA')
+  COMMENT = 'Refreshes Silver Kaggle metadata when new data arrives'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.SILVER.MOVIES_METADATA_INCREMENTAL tgt
+  USING (
+    SELECT
+      TRY_CAST(ID AS NUMBER) AS MOVIE_ID, TITLE,
+      TRY_CAST(BUDGET AS NUMBER) AS BUDGET, TRY_CAST(REVENUE AS NUMBER) AS REVENUE,
+      TRY_CAST(POPULARITY AS FLOAT) AS POPULARITY, TRY_CAST(VOTE_AVERAGE AS FLOAT) AS VOTE_AVERAGE,
+      TRY_CAST(VOTE_COUNT AS NUMBER) AS VOTE_COUNT, GENRES, PRODUCTION_COMPANIES,
+      TRY_CAST(RUNTIME AS NUMBER) AS RUNTIME, TRY_TO_DATE(RELEASE_DATE) AS RELEASE_DATE,
+      YEAR(TRY_TO_DATE(RELEASE_DATE)) AS RELEASE_YEAR, ORIGINAL_LANGUAGE, STATUS, IMDB_ID
+    FROM MOVIE_PROJECT_DB.BRONZE_API_KAGGLE2.MOVIES_METADATA
+    WHERE TRY_CAST(ID AS NUMBER) IS NOT NULL AND TITLE IS NOT NULL
+  ) src ON tgt.MOVIE_ID = src.MOVIE_ID
+  WHEN MATCHED THEN UPDATE SET
+    tgt.TITLE = src.TITLE, tgt.BUDGET = src.BUDGET, tgt.REVENUE = src.REVENUE,
+    tgt.POPULARITY = src.POPULARITY, tgt.VOTE_AVERAGE = src.VOTE_AVERAGE,
+    tgt.VOTE_COUNT = src.VOTE_COUNT, tgt.GENRES = src.GENRES,
+    tgt.PRODUCTION_COMPANIES = src.PRODUCTION_COMPANIES, tgt.RUNTIME = src.RUNTIME,
+    tgt.RELEASE_DATE = src.RELEASE_DATE, tgt.RELEASE_YEAR = src.RELEASE_YEAR,
+    tgt.ORIGINAL_LANGUAGE = src.ORIGINAL_LANGUAGE, tgt.STATUS = src.STATUS,
+    tgt.IMDB_ID = src.IMDB_ID, tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (MOVIE_ID, TITLE, BUDGET, REVENUE, POPULARITY, VOTE_AVERAGE, VOTE_COUNT, GENRES, PRODUCTION_COMPANIES, RUNTIME, RELEASE_DATE, RELEASE_YEAR, ORIGINAL_LANGUAGE, STATUS, IMDB_ID)
+    VALUES (src.MOVIE_ID, src.TITLE, src.BUDGET, src.REVENUE, src.POPULARITY, src.VOTE_AVERAGE, src.VOTE_COUNT, src.GENRES, src.PRODUCTION_COMPANIES, src.RUNTIME, src.RELEASE_DATE, src.RELEASE_YEAR, src.ORIGINAL_LANGUAGE, src.STATUS, src.IMDB_ID);
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_silver_kaggle_refresh', 'CDC', 'BRONZE_API_KAGGLE2', 'SILVER.MOVIES_METADATA_INCREMENTAL', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_movielens_refresh
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_pipeline_orchestrator
+  WHEN SYSTEM$STREAM_HAS_DATA('MOVIE_PROJECT_DB.BRONZE_API_MOVIE_LENS.STREAM_RATINGS')
+  COMMENT = 'Refreshes Silver MovieLens aggregation when new ratings arrive'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.SILVER.MOVIELENS_RATINGS_INCREMENTAL tgt
+  USING (
+    SELECT m.MOVIE_ID, m.TITLE, m.GENRES,
+      AVG(r.RATING) AS AVG_RATING, COUNT(*) AS RATING_COUNT, COUNT(DISTINCT r.USER_ID) AS UNIQUE_USERS
+    FROM MOVIE_PROJECT_DB.BRONZE_API_MOVIE_LENS.MOVIES m
+    JOIN MOVIE_PROJECT_DB.BRONZE_API_MOVIE_LENS.RATINGS r ON m.MOVIE_ID = r.MOVIE_ID
+    GROUP BY m.MOVIE_ID, m.TITLE, m.GENRES
+  ) src ON tgt.MOVIE_ID = src.MOVIE_ID
+  WHEN MATCHED THEN UPDATE SET
+    tgt.AVG_RATING = src.AVG_RATING, tgt.RATING_COUNT = src.RATING_COUNT,
+    tgt.UNIQUE_USERS = src.UNIQUE_USERS, tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (MOVIE_ID, TITLE, GENRES, AVG_RATING, RATING_COUNT, UNIQUE_USERS)
+    VALUES (src.MOVIE_ID, src.TITLE, src.GENRES, src.AVG_RATING, src.RATING_COUNT, src.UNIQUE_USERS);
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_silver_movielens_refresh', 'CDC', 'BRONZE_API_MOVIE_LENS', 'SILVER.MOVIELENS_RATINGS_INCREMENTAL', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+-- =============================================================================
+-- SECTION 3: GOLD LAYER TASKS (chained after Silver)
+-- =============================================================================
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_dim_movies
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_silver_imdb_refresh,
+       MOVIE_PROJECT_DB.PUBLIC.task_silver_kaggle_refresh
+  COMMENT = 'Builds Gold DIM_MOVIES after both IMDB and Kaggle Silver are refreshed'
+AS
+BEGIN
+  CREATE OR REPLACE TABLE MOVIE_PROJECT_DB.GOLD.DIM_MOVIES AS
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY sm.MOVIE_ID) AS MOVIE_SK,
+    sm.MOVIE_ID, sm.TITLE, sm.ORIGINAL_LANGUAGE, sm.STATUS, sm.RUNTIME,
+    sm.RELEASE_DATE, sm.RELEASE_YEAR, sm.BUDGET, sm.REVENUE, sm.IMDB_ID,
+    im.TCONST, im.IMDB_RATING, im.NUMVOTES,
+    sm.POPULARITY AS TMDB_POPULARITY, sm.VOTE_AVERAGE AS TMDB_VOTE_AVERAGE,
+    sm.VOTE_COUNT AS TMDB_VOTE_COUNT, sm.PRODUCTION_COMPANIES, sm.GENRES AS GENRES_JSON
+  FROM MOVIE_PROJECT_DB.SILVER.MOVIES_METADATA_INCREMENTAL sm
+  LEFT JOIN MOVIE_PROJECT_DB.SILVER.IMDB_MOVIES_INCREMENTAL im ON sm.IMDB_ID = im.TCONST;
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_gold_dim_movies', 'BATCH', 'SILVER', 'GOLD.DIM_MOVIES', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_movie_popularity
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_silver_imdb_refresh
+  COMMENT = 'Builds Gold MOVIE_POPULARITY with cross-source popularity metrics'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.GOLD.MOVIE_POPULARITY tgt
+  USING (
+    SELECT
+      im.TCONST, im.TITLE, im.GENRES, im.RELEASE_YEAR,
+      im.IMDB_RATING, im.NUMVOTES,
+      ml.AVG_RATING AS MOVIELENS_AVG_RATING,
+      ml.RATING_COUNT AS MOVIELENS_RATING_COUNT,
+      sm.POPULARITY AS TMDB_POPULARITY,
+      sm.VOTE_AVERAGE AS TMDB_VOTE_AVERAGE
+    FROM MOVIE_PROJECT_DB.SILVER.IMDB_MOVIES_INCREMENTAL im
+    LEFT JOIN MOVIE_PROJECT_DB.SILVER.MOVIELENS_RATINGS_INCREMENTAL ml ON im.TITLE = ml.TITLE
+    LEFT JOIN MOVIE_PROJECT_DB.SILVER.MOVIES_METADATA_INCREMENTAL sm ON im.TCONST = sm.IMDB_ID
+  ) src ON tgt.TCONST = src.TCONST
+  WHEN MATCHED THEN UPDATE SET
+    tgt.TITLE = src.TITLE, tgt.GENRES = src.GENRES, tgt.RELEASE_YEAR = src.RELEASE_YEAR,
+    tgt.IMDB_RATING = src.IMDB_RATING, tgt.NUMVOTES = src.NUMVOTES,
+    tgt.MOVIELENS_AVG_RATING = src.MOVIELENS_AVG_RATING,
+    tgt.MOVIELENS_RATING_COUNT = src.MOVIELENS_RATING_COUNT,
+    tgt.TMDB_POPULARITY = src.TMDB_POPULARITY, tgt.TMDB_VOTE_AVERAGE = src.TMDB_VOTE_AVERAGE,
+    tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (TCONST, TITLE, GENRES, RELEASE_YEAR, IMDB_RATING, NUMVOTES,
+    MOVIELENS_AVG_RATING, MOVIELENS_RATING_COUNT, TMDB_POPULARITY, TMDB_VOTE_AVERAGE)
+  VALUES (src.TCONST, src.TITLE, src.GENRES, src.RELEASE_YEAR, src.IMDB_RATING, src.NUMVOTES,
+    src.MOVIELENS_AVG_RATING, src.MOVIELENS_RATING_COUNT, src.TMDB_POPULARITY, src.TMDB_VOTE_AVERAGE);
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_gold_movie_popularity', 'BATCH', 'SILVER', 'GOLD.MOVIE_POPULARITY', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_financial
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_silver_kaggle_refresh
+  COMMENT = 'Builds Gold FINANCIAL_PERFORMANCE from Kaggle financial data'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.GOLD.FINANCIAL_PERFORMANCE tgt
+  USING (
+    SELECT
+      MOVIE_ID, TITLE, BUDGET, REVENUE,
+      REVENUE - BUDGET AS PROFIT,
+      CASE WHEN BUDGET > 0 THEN (REVENUE - BUDGET) * 100.0 / BUDGET ELSE NULL END AS ROI,
+      CASE WHEN REVENUE > 0 THEN (REVENUE - BUDGET) * 100.0 / REVENUE ELSE NULL END AS PROFIT_MARGIN,
+      RELEASE_YEAR, GENRES, PRODUCTION_COMPANIES
+    FROM MOVIE_PROJECT_DB.SILVER.MOVIES_METADATA_INCREMENTAL
+    WHERE BUDGET > 0 AND REVENUE > 0
+  ) src ON tgt.MOVIE_ID = src.MOVIE_ID
+  WHEN MATCHED THEN UPDATE SET
+    tgt.TITLE = src.TITLE, tgt.BUDGET = src.BUDGET, tgt.REVENUE = src.REVENUE,
+    tgt.PROFIT = src.PROFIT, tgt.ROI = src.ROI, tgt.PROFIT_MARGIN = src.PROFIT_MARGIN,
+    tgt.RELEASE_YEAR = src.RELEASE_YEAR, tgt.GENRES = src.GENRES,
+    tgt.PRODUCTION_COMPANIES = src.PRODUCTION_COMPANIES, tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (MOVIE_ID, TITLE, BUDGET, REVENUE, PROFIT, ROI, PROFIT_MARGIN, RELEASE_YEAR, GENRES, PRODUCTION_COMPANIES)
+    VALUES (src.MOVIE_ID, src.TITLE, src.BUDGET, src.REVENUE, src.PROFIT, src.ROI, src.PROFIT_MARGIN, src.RELEASE_YEAR, src.GENRES, src.PRODUCTION_COMPANIES);
+
+  CALL MOVIE_PROJECT_DB.OBSERVABILITY.log_execution(
+    'task_gold_financial', 'BATCH', 'SILVER', 'GOLD.FINANCIAL_PERFORMANCE', 'SUCCESS', NULL, NULL, NULL
+  );
+END;
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_genre_performance
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_gold_financial
+  COMMENT = 'Builds Gold GENRE_PERFORMANCE from financial data'
+AS
+BEGIN
+  MERGE INTO MOVIE_PROJECT_DB.GOLD.GENRE_PERFORMANCE tgt
+  USING (
+    SELECT
+      g.VALUE::STRING AS GENRE, fp.RELEASE_YEAR,
+      COUNT(*) AS TOTAL_MOVIES,
+      AVG(fp.ROI) AS AVG_ROI,
+      AVG(fp.REVENUE) AS AVG_REVENUE,
+      AVG(fp.BUDGET) AS AVG_BUDGET,
+      AVG(fp.PROFIT) AS AVG_PROFIT,
+      NULL AS AVG_RUNTIME,
+      SUM(fp.REVENUE) AS TOTAL_VOTES
+    FROM MOVIE_PROJECT_DB.GOLD.FINANCIAL_PERFORMANCE fp,
+      LATERAL FLATTEN(INPUT => SPLIT(
+        REGEXP_REPLACE(REGEXP_REPLACE(fp.GENRES, '\\[|\\]|\\{|\\}|''|"', ''), 'id: [0-9]+, name: ', ''), ','
+      )) g
+    WHERE fp.RELEASE_YEAR IS NOT NULL
+    GROUP BY g.VALUE::STRING, fp.RELEASE_YEAR
+    HAVING g.VALUE::STRING != ''
+  ) src ON tgt.GENRE = src.GENRE AND tgt.RELEASE_YEAR = src.RELEASE_YEAR
+  WHEN MATCHED THEN UPDATE SET
+    tgt.TOTAL_MOVIES = src.TOTAL_MOVIES, tgt.AVG_RATING = src.AVG_ROI,
+    tgt.AVG_REVENUE = src.AVG_REVENUE, tgt.AVG_BUDGET = src.AVG_BUDGET,
+    tgt.AVG_PROFIT = src.AVG_PROFIT, tgt.TOTAL_VOTES = src.TOTAL_VOTES,
+    tgt.LAST_UPDATED = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (GENRE, RELEASE_YEAR, TOTAL_MOVIES, AVG_RATING, AVG_REVENUE, AVG_BUDGET, AVG_PROFIT, AVG_RUNTIME, TOTAL_VOTES)
+    VALUES (src.GENRE, src.RELEASE_YEAR, src.TOTAL_MOVIES, src.AVG_ROI, src.AVG_REVENUE, src.AVG_BUDGET, src.AVG_PROFIT, src.AVG_RUNTIME, src.TOTAL_VOTES);
+END;
+
+-- =============================================================================
+-- SECTION 4: POST-REFRESH DATA QUALITY CHECK
+-- =============================================================================
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_dq_post_refresh
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_gold_dim_movies,
+       MOVIE_PROJECT_DB.PUBLIC.task_gold_movie_popularity,
+       MOVIE_PROJECT_DB.PUBLIC.task_gold_financial
+  COMMENT = 'Runs data quality checks after Gold layer refresh'
+AS
+  CALL MOVIE_PROJECT_DB.DATA_QUALITY.run_all_tests();
+
+-- =============================================================================
+-- SECTION 5: PIPELINE COMPLETION LOGGER
+-- =============================================================================
+
+CREATE OR REPLACE TASK MOVIE_PROJECT_DB.PUBLIC.task_pipeline_complete
+  WAREHOUSE = COMPUTE_WH
+  AFTER MOVIE_PROJECT_DB.PUBLIC.task_dq_post_refresh
+  COMMENT = 'Logs pipeline completion and calculates total execution time'
+AS
+BEGIN
+  UPDATE MOVIE_PROJECT_DB.OBSERVABILITY.PIPELINE_EXECUTION_LOG
+  SET STATUS = 'SUCCESS',
+      EXECUTION_END = CURRENT_TIMESTAMP(),
+      DURATION_SECONDS = DATEDIFF('SECOND', EXECUTION_START, CURRENT_TIMESTAMP())
+  WHERE TASK_NAME = 'task_pipeline_orchestrator'
+    AND STATUS = 'RUNNING'
+    AND EXECUTION_START >= DATEADD('MINUTE', -30, CURRENT_TIMESTAMP());
+END;
+
+-- =============================================================================
+-- SECTION 6: SLA MONITORING VIEW
+-- =============================================================================
+
+CREATE OR REPLACE VIEW MOVIE_PROJECT_DB.OBSERVABILITY.PIPELINE_SLA_STATUS AS
+SELECT
+    TASK_NAME,
+    STATUS,
+    EXECUTION_START,
+    EXECUTION_END,
+    DURATION_SECONDS,
+    CASE
+        WHEN DURATION_SECONDS IS NULL THEN 'RUNNING'
+        WHEN DURATION_SECONDS <= 300 THEN 'WITHIN SLA (5 min)'
+        WHEN DURATION_SECONDS <= 600 THEN 'WARNING (5-10 min)'
+        ELSE 'SLA BREACH (>10 min)'
+    END AS SLA_STATUS
+FROM MOVIE_PROJECT_DB.OBSERVABILITY.PIPELINE_EXECUTION_LOG
+WHERE EXECUTION_START >= DATEADD('DAY', -7, CURRENT_TIMESTAMP())
+ORDER BY EXECUTION_START DESC;
+
+-- =============================================================================
+-- SECTION 7: TASK DEPENDENCY VISUALIZATION VIEW
+-- =============================================================================
+
+CREATE OR REPLACE VIEW MOVIE_PROJECT_DB.OBSERVABILITY.TASK_DAG AS
+SELECT
+    NAME AS TASK_NAME,
+    STATE,
+    SCHEDULE,
+    PREDECESSORS,
+    CONDITION,
+    COMMENT,
+    LAST_COMMITTED_ON
+FROM TABLE(INFORMATION_SCHEMA.TASK_DEPENDENTS(
+    TASK_NAME => 'MOVIE_PROJECT_DB.PUBLIC.TASK_PIPELINE_ORCHESTRATOR',
+    RECURSIVE => TRUE
+));
+
+-- =============================================================================
+-- SECTION 8: RESUME ALL TASKS (bottom-up to respect dependencies)
+-- =============================================================================
+
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_pipeline_complete RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_dq_post_refresh RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_genre_performance RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_financial RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_movie_popularity RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_gold_dim_movies RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_imdb_refresh RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_kaggle_refresh RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_silver_movielens_refresh RESUME;
+ALTER TASK MOVIE_PROJECT_DB.PUBLIC.task_pipeline_orchestrator RESUME;
